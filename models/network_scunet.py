@@ -3,9 +3,6 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
-from thop import profile
-from einops import rearrange 
-from einops.layers.torch import Rearrange, Reduce
 from timm.models.layers import trunc_normal_, DropPath
 
 
@@ -21,27 +18,36 @@ class WMSA(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.n_heads = input_dim//head_dim
         self.window_size = window_size
-        self.type=type
+        self.type = type
         self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
 
-        # TODO recover
-        # self.relative_position_params = nn.Parameter(torch.zeros(self.n_heads, 2 * window_size - 1, 2 * window_size -1))
         self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
 
         self.linear = nn.Linear(self.input_dim, self.output_dim)
 
         trunc_normal_(self.relative_position_params, std=.02)
-        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
+        self.relative_position_params = torch.nn.Parameter(
+            self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).permute(2, 0, 1)
+        )
 
-    def generate_mask(self, h, w, p, shift):
+    def generate_mask(self, h: int, w: int, p: int, shift: int) -> torch.Tensor:
         """ generating the mask of SW-MSA
         Args:
+            h, w: height and width
+            p: window size
             shift: shift parameters in CyclicShift.
         Returns:
             attn_mask: should be (1 1 w p p),
         """
-        # supporting sqaure.
-        attn_mask = torch.zeros(h, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
+        # Convert integers to tensors and ensure they're on the right device
+        h = torch.tensor(h, device=self.relative_position_params.device)
+        w = torch.tensor(w, device=self.relative_position_params.device)
+        p = torch.tensor(p, device=self.relative_position_params.device)
+        shift = torch.tensor(shift, device=self.relative_position_params.device)
+        
+        # supporting square window
+        attn_mask = torch.zeros(h.item(), w.item(), p.item(), p.item(), p.item(), p.item(), 
+                              dtype=torch.bool, device=self.relative_position_params.device)
         if self.type == 'W':
             return attn_mask
 
@@ -50,8 +56,25 @@ class WMSA(nn.Module):
         attn_mask[-1, :, s:, :, :s, :] = True
         attn_mask[:, -1, :, :s, :, s:] = True
         attn_mask[:, -1, :, s:, :, :s] = True
-        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
+        # Reshape to 1, 1, (w1*w2), (p1*p2), (p3*p4)
+        attn_mask = attn_mask.view(1, 1, h.item()*w.item(), p.item()*p.item(), p.item()*p.item())
         return attn_mask
+
+    def relative_embedding(self):
+        # Pre-compute all coordinates in a tensor form
+        coords = torch.zeros((self.window_size * self.window_size, 2), dtype=torch.long, device=self.relative_position_params.device)
+        idx = 0
+        for i in range(self.window_size):
+            for j in range(self.window_size):
+                coords[idx, 0] = i
+                coords[idx, 1] = j
+                idx += 1
+        
+        # Calculate all possible coordinate differences
+        relation = coords.unsqueeze(1) - coords.unsqueeze(0) + self.window_size - 1
+        
+        # Get the corresponding relative position embeddings
+        return self.relative_position_params[:, relation[:, :, 0], relation[:, :, 1]]
 
     def forward(self, x):
         """ Forward pass of Window Multi-head Self-attention module.
@@ -61,38 +84,60 @@ class WMSA(nn.Module):
         Returns:
             output: tensor shape [b h w c]
         """
+        b, h, w, c = x.shape
         if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
-        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
+        # Native PyTorch view and permute instead of einops.rearrange
+        x = x.view(b, h // self.window_size, self.window_size, w // self.window_size, self.window_size, c)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
         h_windows = x.size(1)
         w_windows = x.size(2)
-        # sqaure validation
-        # assert h_windows == w_windows
 
-        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
+        x = x.view(b, h_windows * w_windows, self.window_size * self.window_size, c)
         qkv = self.embedding_layer(x)
-        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
-        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
-        # Adding learnable relative embedding
-        sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
-        # Using Attn Mask to distinguish different subwindows.
-        if self.type != 'W':
-            attn_mask = self.generate_mask(h_windows, w_windows, self.window_size, shift=self.window_size//2)
-            sim = sim.masked_fill_(attn_mask, float("-inf"))
+        
+        # Native PyTorch view and permute instead of einops.rearrange
+        qkv = qkv.view(b, -1, self.window_size * self.window_size, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(3, 0, 1, 2, 4, 5).contiguous()
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        probs = nn.functional.softmax(sim, dim=-1)
-        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
-        output = rearrange(output, 'h b w p c -> b w p (h c)')
+        # Calculate attention scores
+        q = q * self.scale
+        attn = torch.einsum('bnphc,bnqhc->bnhpq', q, k)
+        
+        rel_pos_embedding = self.relative_embedding()
+        window_area = self.window_size * self.window_size
+        rel_pos_embedding = rel_pos_embedding.view(self.n_heads, window_area, window_area)
+        rel_pos_embedding = rel_pos_embedding.unsqueeze(0).unsqueeze(0)
+        attn = attn + rel_pos_embedding
+
+        # Apply mask if needed
+        if self.type != 'W':
+            attn_mask = self.generate_mask(h_windows, w_windows, self.window_size, shift=self.window_size // 2)
+            # attn: [b, n_windows, n_heads, window_area, window_area]
+            # attn_mask: [1, 1, n_windows, window_area, window_area]
+            b = x.shape[0]
+            n_windows = h_windows * w_windows
+            attn = attn.view(b * n_windows, self.n_heads, window_area, window_area)
+            attn_mask = attn_mask.expand(b, 1, n_windows, window_area, window_area).reshape(b * n_windows, 1, window_area, window_area)
+            attn = attn.masked_fill(attn_mask, float("-inf"))
+            attn = attn.view(b, n_windows, self.n_heads, window_area, window_area)
+        
+        # Softmax and apply attention
+        attn = torch.softmax(attn, dim=-1)
+        output = torch.einsum('bnhpq,bnqhc->bnphc', attn, v)
+        
+        # Native PyTorch view and permute instead of einops.rearrange
+        output = output.permute(1, 0, 2, 3, 4).contiguous().view(b, h_windows, w_windows, self.window_size, self.window_size, c)
+        output = output.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, c)
         output = self.linear(output)
-        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
+        
+        # Native PyTorch view and permute instead of einops.rearrange
+        output = output.view(b, h_windows, self.window_size, w_windows, self.window_size, c)
+        output = output.permute(0, 1, 2, 3, 4, 5).contiguous()
+        output = output.view(b, h_windows * self.window_size, w_windows * self.window_size, c)
 
         if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
         return output
-
-    def relative_embedding(self):
-        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
-        relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
-        # negative is allowed
-        return self.relative_position_params[:, relation[:,:,0].long(), relation[:,:,1].long()]
 
 
 class Block(nn.Module):
@@ -154,9 +199,13 @@ class ConvTransBlock(nn.Module):
     def forward(self, x):
         conv_x, trans_x = torch.split(self.conv1_1(x), (self.conv_dim, self.trans_dim), dim=1)
         conv_x = self.conv_block(conv_x) + conv_x
-        trans_x = Rearrange('b c h w -> b h w c')(trans_x)
+        
+        # BCHW -> BHWC for transformer blocks
+        trans_x = trans_x.permute(0, 2, 3, 1)
         trans_x = self.trans_block(trans_x)
-        trans_x = Rearrange('b h w c -> b c h w')(trans_x)
+        # BHWC -> BCHW for concatenation
+        trans_x = trans_x.permute(0, 3, 1, 2)
+        
         res = self.conv1_2(torch.cat((conv_x, trans_x), dim=1))
         x = x + res
 
@@ -175,6 +224,7 @@ class SCUNet(nn.Module):
         # drop path rate for each layer
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
 
+        # use in_nc for input channels (for greyscale, in_nc=1)
         self.m_head = [nn.Conv2d(in_nc, dim, 3, 1, 1, bias=False)]
 
         begin = 0
@@ -225,13 +275,16 @@ class SCUNet(nn.Module):
         #self.apply(self._init_weights)
 
     def forward(self, x0):
+        h, w = x0.shape[2], x0.shape[3]
+        
+        # Calculate padding sizes
+        paddingBottom = int(math.ceil(h/64)*64-h)
+        paddingRight = int(math.ceil(w/64)*64-w)
+        
+        # Apply padding
+        x0_padded = nn.functional.pad(x0, (0, paddingRight, 0, paddingBottom), mode='replicate')
 
-        h, w = x0.size()[-2:]
-        paddingBottom = int(np.ceil(h/64)*64-h)
-        paddingRight = int(np.ceil(w/64)*64-w)
-        x0 = nn.ReplicationPad2d((0, paddingRight, 0, paddingBottom))(x0)
-
-        x1 = self.m_head(x0)
+        x1 = self.m_head(x0_padded)
         x2 = self.m_down1(x1)
         x3 = self.m_down2(x2)
         x4 = self.m_down3(x3)
@@ -241,7 +294,8 @@ class SCUNet(nn.Module):
         x = self.m_up1(x+x2)
         x = self.m_tail(x+x1)
 
-        x = x[..., :h, :w]
+        # Remove padding
+        x = x[:, :, :h, :w]
         
         return x
 
@@ -256,12 +310,18 @@ class SCUNet(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
 
+class SCUNetWrapper(nn.Module):
+    """Wrapper for SCUNet to make it script-friendly."""
+    def __init__(self, in_nc=3, config=[2, 2, 2, 2, 2, 2, 2], dim=64, drop_path_rate=0.0, input_resolution=256):
+        super(SCUNetWrapper, self).__init__()
+        self.model = SCUNet(in_nc=in_nc, config=config, dim=dim, drop_path_rate=drop_path_rate, input_resolution=input_resolution)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
 
 if __name__ == '__main__':
-
-    # torch.cuda.empty_cache()
     net = SCUNet()
-
     x = torch.randn((2, 3, 64, 128))
     x = net(x)
     print(x.shape)
