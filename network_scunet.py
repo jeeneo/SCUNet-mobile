@@ -31,50 +31,39 @@ class WMSA(nn.Module):
         )
 
     def generate_mask(self, h: int, w: int, p: int, shift: int) -> torch.Tensor:
-        """ generating the mask of SW-MSA
-        Args:
-            h, w: height and width
-            p: window size
-            shift: shift parameters in CyclicShift.
-        Returns:
-            attn_mask: should be (1 1 w p p),
-        """
-        # Convert integers to tensors and ensure they're on the right device
-        h = torch.tensor(h, device=self.relative_position_params.device)
-        w = torch.tensor(w, device=self.relative_position_params.device)
-        p = torch.tensor(p, device=self.relative_position_params.device)
-        shift = torch.tensor(shift, device=self.relative_position_params.device)
-        
-        # supporting square window
-        attn_mask = torch.zeros(h.item(), w.item(), p.item(), p.item(), p.item(), p.item(), 
-                              dtype=torch.bool, device=self.relative_position_params.device)
+        """Generating the mask of SW-MSA with ONNX-friendly operations"""
+        device = self.relative_position_params.device
+        # Create base mask of zeros
+        attn_mask = torch.zeros(1, 1, h*w, p*p, p*p, dtype=torch.bool, device=device)
         if self.type == 'W':
             return attn_mask
 
         s = p - shift
-        attn_mask[-1, :, :s, :, s:, :] = True
-        attn_mask[-1, :, s:, :, :s, :] = True
-        attn_mask[:, -1, :, :s, :, s:] = True
-        attn_mask[:, -1, :, s:, :, :s] = True
-        # Reshape to 1, 1, (w1*w2), (p1*p2), (p3*p4)
-        attn_mask = attn_mask.view(1, 1, h.item()*w.item(), p.item()*p.item(), p.item()*p.item())
+        # Create explicit ranges for more ONNX-friendly indexing
+        last_h = h*w - 1  # Index of last window
+        attn_mask[0, 0, last_h, :s, s:] = True
+        attn_mask[0, 0, last_h, s:, :s] = True
+        
         return attn_mask
 
     def relative_embedding(self):
-        # Pre-compute all coordinates in a tensor form
-        coords = torch.zeros((self.window_size * self.window_size, 2), dtype=torch.long, device=self.relative_position_params.device)
-        idx = 0
-        for i in range(self.window_size):
-            for j in range(self.window_size):
-                coords[idx, 0] = i
-                coords[idx, 1] = j
-                idx += 1
+        device = self.relative_position_params.device
+        window_size = self.window_size
         
-        # Calculate all possible coordinate differences
-        relation = coords.unsqueeze(1) - coords.unsqueeze(0) + self.window_size - 1
+        # Create coordinates using meshgrid for ONNX compatibility
+        coords_h = torch.arange(window_size, device=device)
+        coords_w = torch.arange(window_size, device=device)
+        coords = torch.meshgrid(coords_h, coords_w, indexing='ij')
+        coords = torch.stack(coords).flatten(1).transpose(0, 1)
         
-        # Get the corresponding relative position embeddings
-        return self.relative_position_params[:, relation[:, :, 0], relation[:, :, 1]]
+        # Calculate relative positions using broadcasting
+        coords_flatten = coords.unsqueeze(1)
+        relative_coords = coords_flatten - coords.unsqueeze(0)
+        relative_coords = relative_coords + window_size - 1
+        
+        # Get embeddings using basic indexing
+        relative_position_idx = relative_coords[:, :, 0] * (2 * window_size - 1) + relative_coords[:, :, 1]
+        return self.relative_position_params[:, relative_coords[:, :, 0], relative_coords[:, :, 1]]
 
     def forward(self, x):
         """ Forward pass of Window Multi-head Self-attention module.
@@ -86,7 +75,6 @@ class WMSA(nn.Module):
         """
         b, h, w, c = x.shape
         if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
-        # Native PyTorch view and permute instead of einops.rearrange
         x = x.view(b, h // self.window_size, self.window_size, w // self.window_size, self.window_size, c)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
         h_windows = x.size(1)
@@ -95,14 +83,14 @@ class WMSA(nn.Module):
         x = x.view(b, h_windows * w_windows, self.window_size * self.window_size, c)
         qkv = self.embedding_layer(x)
         
-        # Native PyTorch view and permute instead of einops.rearrange
         qkv = qkv.view(b, -1, self.window_size * self.window_size, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(3, 0, 1, 2, 4, 5).contiguous()
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # Calculate attention scores
+        # Replace einsum with equivalent matrix operations
         q = q * self.scale
-        attn = torch.einsum('bnphc,bnqhc->bnhpq', q, k)
+        # attn = torch.einsum('bnphc,bnqhc->bnhpq', q, k)
+        attn = torch.matmul(q.permute(0, 1, 3, 2, 4), k.permute(0, 1, 3, 4, 2))
         
         rel_pos_embedding = self.relative_embedding()
         window_area = self.window_size * self.window_size
@@ -113,18 +101,23 @@ class WMSA(nn.Module):
         # Apply mask if needed
         if self.type != 'W':
             attn_mask = self.generate_mask(h_windows, w_windows, self.window_size, shift=self.window_size // 2)
-            # attn: [b, n_windows, n_heads, window_area, window_area]
-            # attn_mask: [1, 1, n_windows, window_area, window_area]
             b = x.shape[0]
             n_windows = h_windows * w_windows
+            
+            # Reshape without advanced indexing
             attn = attn.view(b * n_windows, self.n_heads, window_area, window_area)
-            attn_mask = attn_mask.expand(b, 1, n_windows, window_area, window_area).reshape(b * n_windows, 1, window_area, window_area)
-            attn = attn.masked_fill(attn_mask, float("-inf"))
+            mask = attn_mask.expand(b, 1, n_windows, window_area, window_area)
+            mask = mask.reshape(b * n_windows, 1, window_area, window_area)
+            
+            # Apply mask using basic operations
+            attn = attn.masked_fill(mask, float("-inf"))
             attn = attn.view(b, n_windows, self.n_heads, window_area, window_area)
         
         # Softmax and apply attention
         attn = torch.softmax(attn, dim=-1)
-        output = torch.einsum('bnhpq,bnqhc->bnphc', attn, v)
+        # Replace einsum with equivalent matrix operation
+        # output = torch.einsum('bnhpq,bnqhc->bnphc', attn, v)
+        output = torch.matmul(attn, v.permute(0, 1, 3, 2, 4)).permute(0, 1, 3, 2, 4)
         
         # Native PyTorch view and permute instead of einops.rearrange
         output = output.permute(1, 0, 2, 3, 4).contiguous().view(b, h_windows, w_windows, self.window_size, self.window_size, c)
@@ -224,7 +217,7 @@ class SCUNet(nn.Module):
         # drop path rate for each layer
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
 
-        # use in_nc for input channels (for greyscale, in_nc=1)
+        # Use in_nc for input channels (for greyscale, in_nc=1)
         self.m_head = [nn.Conv2d(in_nc, dim, 3, 1, 1, bias=False)]
 
         begin = 0
@@ -275,15 +268,17 @@ class SCUNet(nn.Module):
         #self.apply(self._init_weights)
 
     def forward(self, x0):
-        h, w = x0.shape[2], x0.shape[3]
+        # Get input dimensions
+        b, c, h, w = x0.shape
         
-        # Calculate padding sizes
-        paddingBottom = int(math.ceil(h/64)*64-h)
-        paddingRight = int(math.ceil(w/64)*64-w)
+        # Calculate padding sizes using tensor operations
+        h_pad = ((h + 63) // 64) * 64 - h
+        w_pad = ((w + 63) // 64) * 64 - w
         
-        # Apply padding
-        x0_padded = nn.functional.pad(x0, (0, paddingRight, 0, paddingBottom), mode='replicate')
-
+        # Apply padding using reflection padding
+        x0_padded = torch.nn.functional.pad(x0, (0, w_pad, 0, h_pad), mode='reflect')
+        
+        # Rest of the forward pass
         x1 = self.m_head(x0_padded)
         x2 = self.m_down1(x1)
         x3 = self.m_down2(x2)
@@ -294,9 +289,8 @@ class SCUNet(nn.Module):
         x = self.m_up1(x+x2)
         x = self.m_tail(x+x1)
 
-        # Remove padding
+        # Remove padding using tensor slicing
         x = x[:, :, :h, :w]
-        
         return x
 
 
@@ -311,17 +305,25 @@ class SCUNet(nn.Module):
 
 
 class SCUNetWrapper(nn.Module):
-    """Wrapper for SCUNet to make it script-friendly."""
+    """Wrapper for SCUNet optimized for ONNX export."""
     def __init__(self, in_nc=3, config=[2, 2, 2, 2, 2, 2, 2], dim=64, drop_path_rate=0.0, input_resolution=256):
         super(SCUNetWrapper, self).__init__()
         self.model = SCUNet(in_nc=in_nc, config=config, dim=dim, drop_path_rate=drop_path_rate, input_resolution=input_resolution)
+        self.in_nc = in_nc
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
-
+        # Simplified input normalization for better ONNX compatibility
+        x = x.float()
+        x = torch.where(x > 1.0, x / 255.0, x)
+        
+        output = self.model(x)
+        output = torch.clamp(output, 0.0, 1.0)
+        return output
 
 if __name__ == '__main__':
-    net = SCUNet()
-    x = torch.randn((2, 3, 64, 128))
-    x = net(x)
-    print(x.shape)
+    # Update test code for ONNX compatibility
+    net = SCUNetWrapper()
+    x = torch.randn((1, 3, 256, 256))  # Standard test size
+    y = net(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {y.shape}")
